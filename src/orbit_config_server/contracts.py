@@ -53,6 +53,25 @@ def _reject_non_finite(value: str) -> object:
     raise RemoteConfigurationError("Remote configuration contains an invalid number.")
 
 
+def _decode_json(payload: bytes) -> object:
+    """Decode strict UTF-8 JSON while rejecting duplicate keys and non-standard numbers.
+
+    ``json.loads(bytes)`` also accepts UTF-16 and UTF-32. The wire contract is deliberately
+    UTF-8 so adapters have one interoperable encoding and cannot disagree about byte limits.
+    """
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_finite,
+        )
+    except RemoteConfigurationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        raise RemoteConfigurationError("Remote configuration is not valid UTF-8 JSON.") from None
+
+
 def _validate_tree(value: object, *, depth: int = 0, count: list[int] | None = None) -> None:
     """Bound parsed JSON structure before passing values to an application model."""
     if count is None:
@@ -109,16 +128,7 @@ class RemoteConfigSnapshot:
             raise ValueError(
                 f"Remote configuration payloads must be 1 to {MAX_REMOTE_CONFIG_BYTES:,} bytes."
             )
-        try:
-            decoded = json.loads(
-                self.payload,
-                object_pairs_hook=_reject_duplicate_keys,
-                parse_constant=_reject_non_finite,
-            )
-        except RemoteConfigurationError:
-            raise
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
-            raise RemoteConfigurationError("Remote configuration is not valid JSON.") from None
+        decoded = _decode_json(self.payload)
         if not isinstance(decoded, dict):
             raise RemoteConfigurationError("Remote configuration must be a JSON object.")
         _validate_tree(decoded)
@@ -132,12 +142,10 @@ class RemoteConfigSnapshot:
         if not isinstance(model_type, type) or not issubclass(model_type, BaseModel):
             raise TypeError("Remote configuration requires a Pydantic model type.")
         try:
-            values = json.loads(
-                self.payload,
-                object_pairs_hook=_reject_duplicate_keys,
-                parse_constant=_reject_non_finite,
-            )
+            values = _decode_json(self.payload)
             return model_type.model_validate(values)
+        except RemoteConfigurationError:
+            raise
         except Exception:
             raise RemoteConfigurationError(
                 "Remote configuration does not match the registered section model."

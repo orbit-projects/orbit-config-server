@@ -53,6 +53,7 @@ def test_snapshot_rejects_invalid_versions(version: object) -> None:
         b'{"value":Infinity}',
         b"{",
         b"\xff",
+        b'{"host":"db.internal"}'.decode().encode("utf-16"),
     ],
 )
 def test_snapshot_rejects_ambiguous_or_invalid_json(payload: bytes) -> None:

@@ -15,7 +15,7 @@ dependencies = [
   "pydantic>=2.8,<3",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]

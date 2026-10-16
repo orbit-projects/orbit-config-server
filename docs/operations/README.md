@@ -1,180 +1,67 @@
-# Orbit Config Server: operations and security
+# Operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+`orbit-config-server` is a contract and validation library. It does not contact a remote service,
+run a polling task, persist revisions, or manage adapter resources. The application wires those
+responsibilities to an installed provider and owns its startup and shutdown.
 
-## Configuration surface
+## Recommended startup sequence
 
-Environment names found in the package README:
+1. Load a known-good local configuration and register every typed Core section.
+2. Freeze the Core section registry.
+3. Construct the provider with explicit endpoint, identity, timeout, TLS, and retry settings.
+4. Fetch a complete snapshot and apply it through `RemoteConfigSection` before serving traffic if
+   startup requires remote configuration. Otherwise, explicitly define the local fallback behavior.
+5. Start the provider watch task under the application's lifecycle manager and apply each complete
+   snapshot. Treat provider disconnects and rejected revisions as observable operational failures.
+6. During shutdown, stop and await the watch task, then call `provider.aclose()` exactly once.
 
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
+The provider and its SDK own connection pooling, reconnect behavior, authentication, transport
+limits, and cleanup. The application owns task supervision, readiness policy, timeout budgets, and
+the decision to continue serving with the last accepted configuration. Do not block shutdown
+indefinitely while waiting for an unresponsive provider.
 
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
+## Revision and update semantics
 
-## Lifecycle, failure behavior, and limits
+A snapshot is a full JSON object for one registered section, not a patch. Its positive integer
+revision must increase for every newer state. A provider may skip a revision only when its next
+snapshot completely replaces the same section. `RemoteConfigSection` serializes calls to `apply`,
+ignores a revision less than or equal to its in-memory watermark, validates against the exact
+registered Pydantic model class, then asks Core to perform its atomic section reload. The watermark
+advances only after that reload and its observers succeed.
 
-`orbit-config-server` defines a provider-neutral contract for complete, versioned remote
-configuration snapshots. It is the capability layer between Orbit Core's typed configuration
-sections and optional server/provider adapters. It does not include a server, network client,
-transport, credential provider, polling loop, or vendor SDK.
+The watermark is not durable or shared between workers. Supply `last_version` only when the
+adapter has a trustworthy persisted cursor for the same section and provider identity. If multiple
+application processes consume the provider independently, each has its own Core state and
+watermark; this library does not coordinate them. Define startup, replay, missed-update recovery,
+and multi-process rollout behavior in the adapter/application design.
 
-# Orbit Config Server
+## Limits and failures
 
-`orbit-config-server` defines a provider-neutral contract for complete, versioned remote
-configuration snapshots. It is the capability layer between Orbit Core's typed configuration
-sections and optional server/provider adapters. It does not include a server, network client,
-transport, credential provider, polling loop, or vendor SDK.
+The wire payload is at most 1 MiB, strict UTF-8 JSON, and a top-level object. Duplicate keys,
+`NaN`/infinities, control characters in keys, keys over 255 characters, nesting deeper than 64
+levels, and trees over 100,000 values are rejected. Typed Pydantic validation failures are
+converted to a generic error so submitted values are not copied into the exception message.
 
-## Install
+An adapter should distinguish transport failures, provider authorization failures, invalid wire
+data, schema mismatch, stale revision, and Core observer rejection in its own structured metrics
+and logs. Log stable error categories and provider request identifiers where safe; never log raw
+payloads, resolved settings, credentials, or unsanitized provider exception text. Define bounded
+retry with jitter for transient failures and avoid retrying permanent schema or access errors.
 
-```bash
-python -m pip install orbit-core orbit-config-server
-```
+## Readiness and rollout
 
-## Validate a provider snapshot
+Choose and document whether remote configuration is required for readiness. A successful initial
+fetch does not prove later provider availability. Roll out schema changes compatibly: deploy code
+that accepts both forms before publishing a snapshot that requires the new form, and remove old
+fields only after all consumers have moved. Validate rollback behavior because an older application
+version may reject a newer snapshot. This package does not provide distributed transactions,
+rollback storage, encryption, or cross-process synchronization.
 
-The application declares the settings model. An adapter fetches a complete JSON-object snapshot;
-the package bounds and validates the wire payload, then validates the values against that model
-before an application can pass the model to Core's atomic section reload API.
+## Production validation checklist
 
-```python
-from pydantic import BaseModel, SecretStr
-
-from orbit.config import ApplicationConfig, Config
-from orbit_config_server import RemoteConfigSection, RemoteConfigSnapshot
-
-
-class DatabaseSettings(BaseModel):
-    host: str
-    password: SecretStr
-
-
-snapshot = RemoteConfigSnapshot(
-    version=12,
-    payload=b'{"host":"db.internal","password":"loaded-by-the-adapter"}',
-)
-# After Core has frozen the section registry:
-config = Config(ApplicationConfig(name="orders"))
-settings = load_database_settings()  # validated settings; secrets come from a secret manager
-config.register("database", settings)
-config.freeze()
-section = RemoteConfigSection(config, "database", DatabaseSettings)
-section.apply(snapshot)
-```
-
-Use `SecretStr`/`SecretBytes` for credential fields. The snapshot's repr omits its payload and
-validation errors omit submitted values, but the payload is intentionally accessible to the
-adapter that must decode it. Never log snapshot payloads, resolved models, transport bodies, or
-provider exceptions containing remote input.
-
-## Provider contract
-
-Implement `RemoteConfigurationProvider` in a separately installable adapter. The provider owns
-its SDK, endpoint and tenant configuration, authentication and credentials, transport, reconnect
-policy, and resource cleanup. `fetch()` returns the current complete snapshot; `watch(after_version=)`
-yields complete replacements with strictly increasing positive versions; `aclose()` releases owned
-resources. Providers may omit intermediate revisions only because each yielded value is a full
-replacement. Credential delivery and rotation must follow the provider's supported secure
-mechanism and must not use command-line arguments or logs.
-
-The current contract accepts at most 1 MiB of UTF-8 JSON per snapshot, rejects duplicate object
-keys, non-finite numbers, invalid keys, and structures beyond 64 levels or 100,000 values. Core's
-registered Pydantic model remains the final application schema and Core's `Config.reload_section()`
-provides the local atomic commit and observer veto. `RemoteConfigSection` serializes concurrent
-updates and ignores repeated or stale versions; its watermark is process-local unless the adapter
-persists and restores it through `last_version`. A rejected Core observer leaves both the section
-and watermark unchanged. Adapters must define durable cursor persistence, retry/backoff, access
-control, transport timeouts, and lifecycle integration; this package does not silently choose those
-policies.
-
-## Scope and status
-
-This package is the Python capability contract for Python Core applications. A provider adapter
-may use its vendor's best-supported language when it has a real process boundary and implements
-the same versioned behavior; application configuration must select that adapter explicitly.
-There is no remote server or provider adapter in this repository, and no live remote configuration
-behavior is claimed. The package supports Python 3.11 through 3.14 and is pre-alpha.
-
-## Development
-
-```bash
-python -m pip install -e '.[dev]'
-pytest
-ruff check src tests
-mypy
-```
-
-Licensed under Apache-2.0.
-
-## Install
-
-```bash
-python -m pip install orbit-core orbit-config-server
-```
-
-## Validate a provider snapshot
-
-The application declares the settings model. An adapter fetches a complete JSON-object snapshot;
-the package bounds and validates the wire payload, then validates the values against that model
-before an application can pass the model to Core's atomic section reload API.
-
-```python
-from pydantic import BaseModel, SecretStr
-
-from orbit.config import ApplicationConfig, Config
-from orbit_config_server import RemoteConfigSection, RemoteConfigSnapshot
-
-
-class DatabaseSettings(BaseModel):
-    host: str
-    password: SecretStr
-
-
-snapshot = RemoteConfigSnapshot(
-    version=12,
-    payload=b'{"host":"db.internal","password":"loaded-by-the-adapter"}',
-)
-# After Core has frozen the section registry:
-config = Config(ApplicationConfig(name="orders"))
-settings = load_database_settings()  # validated settings; secrets come from a secret manager
-config.register("database", settings)
-config.freeze()
-section = RemoteConfigSection(config, "database", DatabaseSettings)
-section.apply(snapshot)
-```
-
-Use `SecretStr`/`SecretBytes` for credential fields. The snapshot's repr omits its payload and
-validation errors omit submitted values, but the payload is intentionally accessible to the
-adapter that must decode it. Never log snapshot payloads, resolved models, transport bodies, or
-provider exceptions containing remote input.
-
-## Provider contract
-
-Implement `RemoteConfigurationProvider` in a separately installable adapter. The provider owns
-its SDK, endpoint and tenant configuration, authentication and credentials, transport, reconnect
-policy, and resource cleanup. `fetch()` returns the current complete snapshot; `watch(after_version=)`
-yields complete replacements with strictly increasing positive versions; `aclose()` releases owned
-resources. Providers may omit intermediate revisions only because each yielded value is a full
-replacement. Credential delivery and rotation must follow the provider's supported secure
-mechanism and must not use command-line arguments or logs.
-
-The current contract accepts at most 1 MiB of UTF-8 JSON per snapshot, rejects duplicate object
-keys, non-finite numbers, invalid keys, and structures beyond 64 levels or 100,000 values. Core's
-registered Pydantic model remains the final application schema and Core's `Config.reload_section()`
-provides the local atomic commit and observer veto. `RemoteConfigSection` serializes concurrent
-updates and ignores repeated or stale versions; its watermark is process-local unless the adapter
-persists and restores it through `last_version`. A rejected Core observer leaves both the section
-and watermark unchanged. Adapters must define durable cursor persistence, retry/backoff, access
-control, transport timeouts, and lifecycle integration; this package does not silently choose those
-policies.
-
-## Scope and status
-
-This package is the Python capability contract for Python Core applications. A provider adapter
-may use its vendor's best-supported language when it has a real process boundary and implements
-the same versioned behavior; application configuration must select that adapter explicitly.
-There is no remote server or provider adapter in this repository, and no live remote configuration
-behavior is claimed. The package supports Python 3.11 through 3.14 and is pre-alpha.
-
-## Production validation
-
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Before using a provider in production, validate its supported Python/runtime and SDK versions,
+least-privilege access, TLS verification, request and connect timeouts, retry/backoff limits,
+secret rotation, cancellation, shutdown, provider outages, malformed and oversized responses,
+revision replay, schema rollout, observer veto, process restart, and multi-worker behavior. Run
+these checks against a dedicated non-production service; this repository contains no provider or
+live-service integration tests.

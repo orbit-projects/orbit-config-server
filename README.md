@@ -73,7 +73,7 @@ This package is the Python capability contract for Python Core applications. A p
 may use its vendor's best-supported language when it has a real process boundary and implements
 the same versioned behavior; application configuration must select that adapter explicitly.
 There is no remote server or provider adapter in this repository, and no live remote configuration
-behavior is claimed. The package supports Python 3.11 through 3.14 and is pre-alpha.
+behavior is claimed. The package supports Python 3.11 through 3.14 and is alpha.
 
 ## Documentation
 
